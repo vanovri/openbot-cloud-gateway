@@ -179,6 +179,18 @@ class SuperviseTests(unittest.TestCase):
         self.assertIn("Server: OpenBot Cloud (online)", summary)
         self.assertIn("Memory: 3100 MiB free of 7800 MiB (ok)", summary)
 
+    def test_probe_openbot_status_waits_while_account_loading(self) -> None:
+        sample = "\n".join([
+            "OpenBot 0.78.0",
+            "Account: loading",
+            "Server: offline",
+        ])
+        fake_exec = mock.Mock(returncode=0, stdout=sample, stderr="")
+        with mock.patch.object(supervise, "container_running", return_value=True), mock.patch.object(supervise, "run", return_value=fake_exec):
+            ok, summary = supervise.probe_openbot_status()
+        self.assertFalse(ok)
+        self.assertEqual(summary, "account_loading")
+
 
 if __name__ == "__main__":
     unittest.main()

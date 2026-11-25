@@ -32,17 +32,18 @@ def run(args: list[str], *, stdin_text: str | None = None, timeout: int = 90) ->
     )
 
 
-def ensure_userns_allowed() -> list[str]:
-    """Ubuntu 24.04 AppArmor may restrict unprivileged userns needed by Electron sandbox."""
-    extra_opts: list[str] = []
+def collect_host_security() -> dict[str, object]:
+    info: dict[str, object] = {}
     sysctl_path = Path("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
     if sysctl_path.exists():
         try:
-            if sysctl_path.read_text(encoding="utf-8").strip() == "1":
-                extra_opts.extend(["--security-opt", "apparmor=unconfined"])
-        except OSError:
-            pass
-    return extra_opts
+            info["apparmor_restrict_unprivileged_userns"] = sysctl_path.read_text(encoding="utf-8").strip()
+        except OSError as exc:
+            info["apparmor_restrict_unprivileged_userns_err"] = str(exc)[:100]
+    res = run(["docker", "info", "--format", "{{.SecurityOptions}}"], timeout=15)
+    if res.returncode == 0:
+        info["docker_security_options"] = sanitize_log_lines(res.stdout, 5)
+    return info
 
 
 def seed_workspace(data_dir: Path, seed_dir: Path) -> None:
@@ -97,6 +98,8 @@ def probe_openbot_status() -> tuple[bool, str]:
     res = run(["docker", "exec", CONTAINER, "openbot", "status"], timeout=20)
     if res.returncode != 0:
         return False, f"status_exit_{res.returncode}"
+    if "account: loading" in res.stdout.lower():
+        return False, "account_loading"
     # Redact any accidental email/token lines; keep only safe status keywords
     lines: list[str] = []
     for raw in res.stdout.splitlines():
@@ -127,6 +130,7 @@ def main() -> int:
     parser.add_argument("--max-runtime", type=int, default=17400)
     parser.add_argument("--probe-interval", type=int, default=60)
     parser.add_argument("--bootstrap-only", action="store_true")
+    parser.add_argument("--smoke-test", action="store_true")
     args = parser.parse_args()
 
     signal.signal(signal.SIGTERM, handle_signal)
@@ -153,7 +157,6 @@ def main() -> int:
         "--name", CONTAINER,
         "--security-opt", f"seccomp={args.seccomp.resolve()}",
         "--security-opt", "no-new-privileges:true",
-        *ensure_userns_allowed(),
         "--shm-size", "1g",
         "--stop-timeout", "60",
         "-e", "TZ=Asia/Jakarta",
@@ -167,10 +170,10 @@ def main() -> int:
             print(json.dumps({"event": "start_failed", "code": start_res.returncode, "err": start_res.stderr.strip()[:400]}), file=sys.stderr, flush=True)
             return 1
 
-        # Wait up to 90s for OpenBot runtime to become responsive to `openbot status`
+        # Wait up to 120s for OpenBot runtime to become responsive to `openbot status`
         ready = False
         last_summary = ""
-        for _ in range(30):
+        for _ in range(40):
             if STOP_REQUESTED:
                 break
             ok, summary = probe_openbot_status()
@@ -183,10 +186,14 @@ def main() -> int:
         if not ready:
             logs = run(["docker", "logs", "--tail", "40", CONTAINER], timeout=15)
             tail = sanitize_log_lines(logs.stdout + "\n" + logs.stderr, 20)
-            print(json.dumps({"event": "startup_unhealthy", "summary": last_summary, "tail": tail}), file=sys.stderr, flush=True)
+            print(json.dumps({"event": "startup_unhealthy", "summary": last_summary, "tail": tail, "host_sec": collect_host_security()}), file=sys.stderr, flush=True)
             return 1
 
         print(json.dumps({"event": "container_ready", "summary": last_summary}), flush=True)
+
+        if args.smoke_test:
+            print(json.dumps({"event": "smoke_test_ok", "summary": last_summary}), flush=True)
+            return 0
 
         # One-time claim sign-in if OPENBOT_CLAIM_ONCE is provided and not yet signed in
         claim = os.environ.get("OPENBOT_CLAIM_ONCE", "").strip()

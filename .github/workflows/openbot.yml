@@ -7,6 +7,10 @@ on:
         description: 'Run a short bootstrap/claim verification cycle (~90s) and immediately seal state/live'
         type: boolean
         default: false
+      smoke_test:
+        description: 'Verify container boots to openbot status without claiming or publishing state'
+        type: boolean
+        default: false
       max_runtime:
         description: 'Max supervision runtime in seconds (default 17400 = 4h50m)'
         type: string
@@ -24,7 +28,7 @@ concurrency:
 
 jobs:
   gateway:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     defaults:
       run:
@@ -68,11 +72,15 @@ jobs:
         env:
           OPENBOT_CLAIM_ONCE: ${{ secrets.OPENBOT_CLAIM_ONCE }}
           BOOTSTRAP_ONLY: ${{ inputs.bootstrap_only && 'true' || 'false' }}
+          SMOKE_TEST: ${{ inputs.smoke_test && 'true' || 'false' }}
           MAX_RUNTIME: ${{ inputs.max_runtime || '17400' }}
         run: |
           EXTRA_ARGS=()
           if [ "$BOOTSTRAP_ONLY" = "true" ]; then
             EXTRA_ARGS+=(--bootstrap-only)
+          fi
+          if [ "$SMOKE_TEST" = "true" ]; then
+            EXTRA_ARGS+=(--smoke-test)
           fi
           python3 ops/supervise.py \
             --image "$OPENBOT_IMAGE" \
