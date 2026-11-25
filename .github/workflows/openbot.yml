@@ -85,7 +85,7 @@ jobs:
       - name: Seal encrypted /data state
         id: persist
         timeout-minutes: 10
-        if: ${{ always() && steps.restore.outcome == 'success' }}
+        if: ${{ always() && steps.restore.outcome == 'success' && steps.gateway.outputs.seal_ok == 'true' }}
         env:
           OPENBOT_BUNDLE_KEY: ${{ secrets.OPENBOT_BUNDLE_KEY }}
         run: |

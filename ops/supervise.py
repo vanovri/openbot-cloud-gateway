@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
@@ -13,6 +14,7 @@ import time
 
 CONTAINER = "openbot"
 STOP_REQUESTED = False
+SENSITIVE_LOG_RE = re.compile(r"(token|claim|secret|password|authorization|cookie)", re.IGNORECASE)
 
 
 def handle_signal(_signum: int, _frame: object) -> None:
@@ -58,6 +60,37 @@ def container_running() -> bool:
     return res.returncode == 0 and res.stdout.strip() == "true"
 
 
+def write_gh_output(key: str, value: str) -> None:
+    gh_out = os.environ.get("GITHUB_OUTPUT")
+    if gh_out:
+        with open(gh_out, "a", encoding="utf-8") as fh:
+            fh.write(f"{key}={value}\n")
+
+
+def sanitize_log_lines(text: str, limit: int = 20) -> list[str]:
+    safe: list[str] = []
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if "@" in line or SENSITIVE_LOG_RE.search(line):
+            continue
+        safe.append(line[:200])
+    return safe[-limit:]
+
+
+def chown_tree(path: Path, owner: str) -> None:
+    if not hasattr(os, "getuid"):
+        return
+    cmd = ["chown", "-Rh", owner, str(path)]
+    if os.geteuid() != 0:
+        cmd = ["sudo", "-n", *cmd]
+    res = run(cmd, timeout=60)
+    if res.returncode != 0:
+        err = " | ".join(sanitize_log_lines(res.stderr + "\n" + res.stdout, 5))
+        raise RuntimeError(f"chown {owner} failed (exit {res.returncode}): {err}")
+
+
 def probe_openbot_status() -> tuple[bool, str]:
     if not container_running():
         return False, "container_not_running"
@@ -65,11 +98,16 @@ def probe_openbot_status() -> tuple[bool, str]:
     if res.returncode != 0:
         return False, f"status_exit_{res.returncode}"
     # Redact any accidental email/token lines; keep only safe status keywords
-    lines = [
-        ln.strip()
-        for ln in res.stdout.splitlines()
-        if any(k in ln.lower() for k in ("version", "server", "state", "memory", "turns", "status", "online", "connected", "signed"))
-    ]
+    lines: list[str] = []
+    for raw in res.stdout.splitlines():
+        ln = raw.strip()
+        low = ln.lower()
+        if not ln or "@" in ln or SENSITIVE_LOG_RE.search(ln):
+            continue
+        if low.startswith("account:") and "signed out" not in low:
+            continue
+        if any(k in low for k in ("openbot ", "version", "server:", "account: signed out", "memory:", "turns", "online", "connected")):
+            lines.append(ln[:200])
     return True, " | ".join(lines[:4]) if lines else "ok"
 
 
@@ -99,6 +137,14 @@ def main() -> int:
     if args.seed:
         seed_workspace(args.data, args.seed)
 
+    need_chown = hasattr(os, "getuid") and os.getuid() != 1000
+    if need_chown:
+        try:
+            chown_tree(args.data, "1000:1000")
+        except Exception as exc:
+            print(json.dumps({"event": "chown_failed", "phase": "pre_start", "err": str(exc)[:300]}), file=sys.stderr, flush=True)
+            return 1
+
     # Remove stale container if present
     run(["docker", "rm", "-f", CONTAINER], timeout=30)
 
@@ -114,12 +160,13 @@ def main() -> int:
         "-v", f"{args.data.resolve()}:/data",
         args.image,
     ]
-    start_res = run(cmd, timeout=120)
-    if start_res.returncode != 0:
-        print(json.dumps({"event": "start_failed", "code": start_res.returncode, "err": start_res.stderr.strip()[:400]}), file=sys.stderr)
-        return 1
-
+    seal_ok = False
     try:
+        start_res = run(cmd, timeout=120)
+        if start_res.returncode != 0:
+            print(json.dumps({"event": "start_failed", "code": start_res.returncode, "err": start_res.stderr.strip()[:400]}), file=sys.stderr, flush=True)
+            return 1
+
         # Wait up to 90s for OpenBot runtime to become responsive to `openbot status`
         ready = False
         last_summary = ""
@@ -135,7 +182,8 @@ def main() -> int:
 
         if not ready:
             logs = run(["docker", "logs", "--tail", "40", CONTAINER], timeout=15)
-            print(json.dumps({"event": "startup_unhealthy", "summary": last_summary, "tail_lines": len(logs.stdout.splitlines())}), file=sys.stderr)
+            tail = sanitize_log_lines(logs.stdout + "\n" + logs.stderr, 20)
+            print(json.dumps({"event": "startup_unhealthy", "summary": last_summary, "tail": tail}), file=sys.stderr, flush=True)
             return 1
 
         print(json.dumps({"event": "container_ready", "summary": last_summary}), flush=True)
@@ -146,16 +194,39 @@ def main() -> int:
             claim_res = run(
                 ["docker", "exec", "-i", CONTAINER, "openbot", "login", "--claim", "--name", args.server_name],
                 stdin_text=claim + "\n",
-                timeout=120,
+                timeout=180,
             )
-            connected = "connected to your account" in (claim_res.stdout + claim_res.stderr).lower()
-            already = "already" in (claim_res.stdout + claim_res.stderr).lower()
-            print(json.dumps({"event": "claim_attempt", "exit_code": claim_res.returncode, "connected": connected, "already_signed_in": already}), flush=True)
-            if claim_res.returncode != 0 and not already:
+            online = bool(re.search(r"^Server:.*\(online\)", claim_res.stdout, re.IGNORECASE | re.MULTILINE))
+            already = (
+                claim_res.returncode == 0
+                and "publishing the server" not in claim_res.stdout.lower()
+                and bool(re.search(r"^OpenBot\s+", claim_res.stdout, re.MULTILINE))
+            )
+            payload: dict[str, object] = {
+                "event": "claim_attempt",
+                "exit_code": claim_res.returncode,
+                "online": online,
+                "already_signed_in": already,
+            }
+            if claim_res.returncode != 0:
+                payload["err_tail"] = sanitize_log_lines(claim_res.stderr, 8)
+            print(json.dumps(payload), flush=True)
+            if claim_res.returncode != 0:
                 return 1
             time.sleep(5)
             ok, summary = probe_openbot_status()
             print(json.dumps({"event": "post_claim_status", "ok": ok, "summary": summary}), flush=True)
+            if not ok or "online" not in summary.lower():
+                print(json.dumps({"event": "post_claim_not_online", "summary": summary}), file=sys.stderr, flush=True)
+                return 1
+            seal_ok = True
+        elif args.bootstrap_only:
+            if "online" not in last_summary.lower():
+                print(json.dumps({"event": "bootstrap_not_online", "summary": last_summary}), file=sys.stderr, flush=True)
+                return 1
+            seal_ok = True
+        else:
+            seal_ok = True
 
         if args.bootstrap_only:
             print(json.dumps({"event": "bootstrap_only_complete"}), flush=True)
@@ -189,6 +260,10 @@ def main() -> int:
     finally:
         print(json.dumps({"event": "graceful_stop_start"}), flush=True)
         stop_container()
+        if need_chown:
+            chown_tree(args.data, f"{os.getuid()}:{os.getgid()}")
+        if seal_ok:
+            write_gh_output("seal_ok", "true")
         print(json.dumps({"event": "graceful_stop_done"}), flush=True)
 
 

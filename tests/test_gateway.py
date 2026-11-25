@@ -14,6 +14,7 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "ops"))
 import state_store  # noqa: E402
+import supervise  # noqa: E402
 import watchdog  # noqa: E402
 
 HAS_OPENSSL = shutil.which("openssl") is not None
@@ -140,6 +141,43 @@ class WatchdogTests(unittest.TestCase):
             res = watchdog.ensure_running("vanovri/openbot-cloud-gateway")
             self.assertEqual(res, {"action": "dispatched"})
             self.assertEqual(mrun.call_count, 2)
+
+
+class SuperviseTests(unittest.TestCase):
+    def test_sanitize_log_lines_redacts_secrets_and_emails(self) -> None:
+        raw = "\n".join([
+            "   ",
+            "User 1000 cannot write to /data",
+            "Account: user@example.com",
+            "Authorization: Bearer abc",
+            "OPENBOT_CLAIM=xyz",
+            "token leaked",
+            "password file missing",
+            "The virtual display :0 did not start.",
+        ])
+        self.assertEqual(
+            supervise.sanitize_log_lines(raw, limit=10),
+            [
+                "User 1000 cannot write to /data",
+                "The virtual display :0 did not start.",
+            ],
+        )
+
+    def test_probe_openbot_status_redacts_email_keeps_safe_lines(self) -> None:
+        sample = "\n".join([
+            "OpenBot 0.78.0",
+            "Account: myserver@example.com",
+            "Server: OpenBot Cloud (online)",
+            "Memory: 3100 MiB free of 7800 MiB (ok)",
+            "Turns at the same time: at most 8",
+        ])
+        fake_exec = mock.Mock(returncode=0, stdout=sample, stderr="")
+        with mock.patch.object(supervise, "container_running", return_value=True), mock.patch.object(supervise, "run", return_value=fake_exec):
+            ok, summary = supervise.probe_openbot_status()
+        self.assertTrue(ok)
+        self.assertNotIn("@", summary)
+        self.assertIn("Server: OpenBot Cloud (online)", summary)
+        self.assertIn("Memory: 3100 MiB free of 7800 MiB (ok)", summary)
 
 
 if __name__ == "__main__":
