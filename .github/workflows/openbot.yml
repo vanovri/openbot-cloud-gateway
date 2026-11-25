@@ -1,0 +1,130 @@
+name: OpenBot 24x7 Cloud Gateway
+
+on:
+  workflow_dispatch:
+    inputs:
+      bootstrap_only:
+        description: 'Run a short bootstrap/claim verification cycle (~90s) and immediately seal state/live'
+        type: boolean
+        default: false
+      max_runtime:
+        description: 'Max supervision runtime in seconds (default 17400 = 4h50m)'
+        type: string
+        default: '17400'
+  schedule:
+    - cron: '25 */5 * * *'
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: openbot-cloud-gateway
+  cancel-in-progress: false
+
+jobs:
+  gateway:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: bash
+    env:
+      TZ: Asia/Jakarta
+      OPENBOT_IMAGE: ghcr.io/nightly-labs/openbot:0.78.0
+      OPENBOT_SERVER_NAME: OpenBot Cloud
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Run unit tests
+        timeout-minutes: 5
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Pull pinned OpenBot Docker image
+        timeout-minutes: 10
+        run: docker pull "$OPENBOT_IMAGE"
+
+      - name: Restore encrypted /data state
+        id: restore
+        timeout-minutes: 10
+        env:
+          OPENBOT_BUNDLE_KEY: ${{ secrets.OPENBOT_BUNDLE_KEY }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          umask 077
+          mkdir -p "$RUNNER_TEMP/openbot-data" "$RUNNER_TEMP/openbot-state"
+          python3 ops/state_store.py restore \
+            --work "$RUNNER_TEMP/openbot-state" \
+            --data "$RUNNER_TEMP/openbot-data" \
+            --allow-bootstrap
+          touch /tmp/openbot-restored-ok
+
+      - name: Run OpenBot Docker server with supervision
+        id: gateway
+        timeout-minutes: 300
+        env:
+          OPENBOT_CLAIM_ONCE: ${{ secrets.OPENBOT_CLAIM_ONCE }}
+          BOOTSTRAP_ONLY: ${{ inputs.bootstrap_only && 'true' || 'false' }}
+          MAX_RUNTIME: ${{ inputs.max_runtime || '17400' }}
+        run: |
+          EXTRA_ARGS=()
+          if [ "$BOOTSTRAP_ONLY" = "true" ]; then
+            EXTRA_ARGS+=(--bootstrap-only)
+          fi
+          python3 ops/supervise.py \
+            --image "$OPENBOT_IMAGE" \
+            --seccomp docker/seccomp.json \
+            --data "$RUNNER_TEMP/openbot-data" \
+            --server-name "$OPENBOT_SERVER_NAME" \
+            --max-runtime "$MAX_RUNTIME" \
+            "${EXTRA_ARGS[@]}"
+
+      - name: Seal encrypted /data state
+        id: persist
+        timeout-minutes: 10
+        if: ${{ always() && steps.restore.outcome == 'success' }}
+        env:
+          OPENBOT_BUNDLE_KEY: ${{ secrets.OPENBOT_BUNDLE_KEY }}
+        run: |
+          umask 077
+          test -f /tmp/openbot-restored-ok
+          python3 ops/state_store.py seal \
+            --work "$RUNNER_TEMP/openbot-state" \
+            --data "$RUNNER_TEMP/openbot-data"
+
+      - name: Retain encrypted recovery artifact before publishing refs
+        id: recovery
+        timeout-minutes: 5
+        if: ${{ always() && steps.persist.outcome == 'success' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: openbot-recovery-bundle-${{ steps.persist.outputs.state_seq }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/openbot-state/publish/openbot-bundle.enc
+            ${{ runner.temp }}/openbot-state/publish/openbot-bundle.meta.json
+          retention-days: 5
+          if-no-files-found: error
+
+      - name: Publish parentless state commit and rotate backups atomically
+        id: publish
+        timeout-minutes: 5
+        if: ${{ always() && steps.recovery.outcome == 'success' }}
+        run: python3 ops/state_store.py publish --work "$RUNNER_TEMP/openbot-state"
+
+      - name: Remove recovery artifact after confirmed state publication
+        if: ${{ always() && steps.publish.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! timeout --kill-after=5s 45s gh api --method DELETE "repos/${GITHUB_REPOSITORY}/actions/artifacts/${{ steps.recovery.outputs.artifact-id }}"; then
+            echo '::warning::Recovery artifact retained until its 5-day expiry'
+          fi
+
+      - name: Queue next cycle after clean handoff
+        if: ${{ always() && steps.publish.outcome == 'success' && steps.gateway.outcome == 'success' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: timeout --kill-after=5s 45s gh workflow run openbot.yml --ref main
