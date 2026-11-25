@@ -122,6 +122,62 @@ class StateStoreTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 state_store.openssl_decrypt(bundle, meta, self.tmp / "out.tar.gz")
 
+    def test_provider_runtimes_excluded_from_archive(self) -> None:
+        import tarfile
+
+        d = self.tmp / "data-rt"
+        rt = d / ".config" / "OpenBot" / "provider-runtimes" / "codex"
+        rt.mkdir(parents=True)
+        (rt / "huge-cli.bin").write_bytes(b"binary" * 100)
+        cfg = d / ".config" / "OpenBot" / "openbot.db"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text("db", encoding="utf-8")
+        keyring = d / ".local" / "share" / "keyrings" / "login.keyring"
+        keyring.parent.mkdir(parents=True, exist_ok=True)
+        keyring.write_text("kr", encoding="utf-8")
+
+        out_tar = self.tmp / "out.tar.gz"
+        proof = state_store.create_data_archive(d, out_tar)
+        self.assertEqual(proof["files"], 2)
+        with tarfile.open(out_tar, "r:gz") as tf:
+            names = tf.getnames()
+        self.assertIn(".config/OpenBot/openbot.db", names)
+        self.assertIn(".local/share/keyrings/login.keyring", names)
+        self.assertFalse(any("provider-runtimes" in n for n in names))
+
+    @unittest.skipUnless(HAS_OPENSSL, "openssl CLI required")
+    def test_multipart_chunked_seal_publish_restore_and_tamper(self) -> None:
+        env = {
+            "OPENBOT_BUNDLE_KEY": "test-passphrase-256bit-verification-key",
+            "GITHUB_RUN_ID": "3001",
+            "GITHUB_RUN_ATTEMPT": "1",
+        }
+        with mock.patch.dict(os.environ, env, clear=False), mock.patch.object(state_store, "CHUNK_BYTES", 1024):
+            w1 = self.tmp / "wm1"
+            d1 = self.tmp / "dm1"
+            state_store.action_restore(self.repo, w1, d1, allow_bootstrap=True, read_only=False)
+            self._make_sample_data(d1, "chunked")
+            (d1 / "payload.bin").write_bytes(os.urandom(8192))
+            s1 = state_store.action_seal(w1, d1)
+            self.assertGreaterEqual(s1["parts"], 2)
+            state_store.action_publish(self.repo, w1)
+
+            w2 = self.tmp / "wm2"
+            d2 = self.tmp / "dm2"
+            r2 = state_store.action_restore(self.repo, w2, d2, allow_bootstrap=False, read_only=False)
+            self.assertEqual(r2, {"bootstrapped": True, "state_seq": 1, "recovered": False})
+            self.assertEqual((d2 / "payload.bin").read_bytes(), (d1 / "payload.bin").read_bytes())
+
+            # Flip 1 byte in part-000 -> fail closed
+            pub = w1 / "publish"
+            meta = json.loads((pub / state_store.META).read_text(encoding="utf-8"))
+            p0 = pub / meta["parts"][0]["name"]
+            raw = bytearray(p0.read_bytes())
+            raw[0] ^= 0xFF
+            p0.write_bytes(bytes(raw))
+            with self.assertRaises(ValueError):
+                state_store.decrypt_candidate(pub, meta, self.tmp / "tamper.tar.gz")
+
 
 class WatchdogTests(unittest.TestCase):
     def test_watchdog_waits_before_bootstrap(self) -> None:

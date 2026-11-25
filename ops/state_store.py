@@ -26,14 +26,19 @@ BUNDLE = "openbot-bundle.enc"
 META = "openbot-bundle.meta.json"
 MARKER = ".openbot-state-generation.json"
 REFS = ["refs/heads/state/live", "refs/heads/state/bak-1", "refs/heads/state/bak-2"]
-MAX_BYTES = 95 * 1024 * 1024  # Keep strictly under GitHub's 100 MiB blob ceiling
+CHUNK_BYTES = 75 * 1024 * 1024  # Keep each Git blob safely under GitHub's 100 MiB ceiling
+MAX_BYTES = CHUNK_BYTES
+MAX_TOTAL_BYTES = 900 * 1024 * 1024
+MAX_PARTS = 16
+PART_NAME_RE = re.compile(r"^openbot-bundle(?:\.part-[0-9]{3})?\.enc$")
 MAX_UNPACKED_BYTES = 2 * 1024 * 1024 * 1024
 MAX_MEMBERS = 120_000
 ARTIFACT_RE = re.compile(r"^openbot-recovery-bundle-(\d+)-(\d+)-(\d+)$")
 HEX64 = re.compile(r"^[a-f0-9]{64}$")
 
-# Volatile caches/sockets/temp dirs excluded so /data stays lean & portable across runners
+# Volatile caches/sockets/temp dirs and stateless binaries excluded so /data stays lean & portable
 SKIP_DIR_NAMES = {
+    "provider-runtimes",
     "Cache",
     "Code Cache",
     "GPUCache",
@@ -124,11 +129,33 @@ def validate_meta(meta: dict) -> dict:
     stamp = datetime.fromisoformat(meta["created_at_utc"])
     if stamp.utcoffset() is None:
         raise ValueError("Timestamp missing timezone")
+    if "parts" in meta:
+        parts = meta["parts"]
+        if not isinstance(parts, list) or not (1 <= len(parts) <= MAX_PARTS):
+            raise ValueError("Invalid parts list")
+        seen: set[str] = set()
+        total = 0
+        for part in parts:
+            if not isinstance(part, dict):
+                raise ValueError("Invalid part entry")
+            pname = part.get("name")
+            psize = part.get("size")
+            psha = part.get("sha256")
+            if not isinstance(pname, str) or not PART_NAME_RE.fullmatch(pname) or pname in seen:
+                raise ValueError(f"Invalid part name: {pname}")
+            if type(psize) is not int or not (1 <= psize <= CHUNK_BYTES):
+                raise ValueError(f"Invalid part size for {pname}")
+            if not isinstance(psha, str) or not HEX64.fullmatch(psha):
+                raise ValueError(f"Invalid part sha256 for {pname}")
+            seen.add(pname)
+            total += psize
+        if total > MAX_TOTAL_BYTES:
+            raise ValueError(f"Total encrypted size exceeds limit: {total} B > {MAX_TOTAL_BYTES} B")
     return meta
 
 
 def inner_marker(meta: dict) -> dict:
-    return {k: v for k, v in meta.items() if k != "bundle_sha256"}
+    return {k: v for k, v in meta.items() if k not in {"bundle_sha256", "parts"}}
 
 
 def is_sqlite_file(path: Path) -> bool:
@@ -256,12 +283,87 @@ def openssl_encrypt(plain: Path, bundle: Path) -> None:
     os.chmod(bundle, 0o600)
 
 
+def expected_parts(meta: dict) -> list[dict] | None:
+    validate_meta(meta)
+    return meta.get("parts")
+
+
+def split_bundle(bundle: Path, pub_dir: Path) -> list[dict]:
+    for stale in pub_dir.glob("openbot-bundle.part-*.enc"):
+        stale.unlink(missing_ok=True)
+    total_size = bundle.stat().st_size
+    if total_size > MAX_TOTAL_BYTES:
+        raise RuntimeError(f"Encrypted bundle exceeds limit: {total_size} B > {MAX_TOTAL_BYTES} B")
+    if total_size <= CHUNK_BYTES:
+        return [{"name": BUNDLE, "size": total_size, "sha256": sha256_file(bundle)}]
+    parts: list[dict] = []
+    idx = 0
+    with bundle.open("rb") as src:
+        while True:
+            if idx >= MAX_PARTS:
+                raise RuntimeError(f"Encrypted bundle requires more than {MAX_PARTS} parts")
+            pname = f"openbot-bundle.part-{idx:03d}.enc"
+            ppath = pub_dir / pname
+            h = hashlib.sha256()
+            written = 0
+            with ppath.open("wb") as dst:
+                while written < CHUNK_BYTES:
+                    chunk = src.read(min(1024 * 1024, CHUNK_BYTES - written))
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+                    h.update(chunk)
+                    written += len(chunk)
+            if written == 0:
+                ppath.unlink(missing_ok=True)
+                break
+            os.chmod(ppath, 0o600)
+            parts.append({"name": pname, "size": written, "sha256": h.hexdigest()})
+            idx += 1
+    bundle.unlink(missing_ok=True)
+    return parts
+
+
+def assemble_bundle(part_dir: Path, meta: dict, dest_bundle: Path) -> Path:
+    parts = expected_parts(meta)
+    if parts is None:
+        return part_dir / BUNDLE
+    if len(parts) == 1 and parts[0]["name"] == BUNDLE:
+        p = part_dir / BUNDLE
+        if not p.is_file() or p.stat().st_size != parts[0]["size"] or sha256_file(p) != parts[0]["sha256"]:
+            raise ValueError("Encrypted bundle part metadata mismatch")
+        return p
+    dest_bundle.parent.mkdir(parents=True, exist_ok=True)
+    h = hashlib.sha256()
+    with dest_bundle.open("wb") as dst:
+        for part in parts:
+            ppath = part_dir / part["name"]
+            if not ppath.is_file():
+                raise ValueError(f"Missing encrypted part: {part['name']}")
+            actual_size = ppath.stat().st_size
+            if actual_size != part["size"] or actual_size > CHUNK_BYTES:
+                raise ValueError(f"Encrypted part size mismatch: {part['name']}")
+            ph = hashlib.sha256()
+            with ppath.open("rb") as src:
+                for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                    dst.write(chunk)
+                    h.update(chunk)
+                    ph.update(chunk)
+            if ph.hexdigest() != part["sha256"]:
+                raise ValueError(f"Encrypted part SHA-256 mismatch: {part['name']}")
+    os.chmod(dest_bundle, 0o600)
+    if h.hexdigest() != meta["bundle_sha256"]:
+        dest_bundle.unlink(missing_ok=True)
+        raise ValueError("Assembled encrypted bundle SHA-256 mismatch")
+    return dest_bundle
+
+
 def openssl_decrypt(bundle: Path, meta: dict, plain_out: Path) -> None:
     if not os.environ.get("OPENBOT_BUNDLE_KEY"):
         raise RuntimeError("OPENBOT_BUNDLE_KEY environment variable is required")
     validate_meta(meta)
-    if bundle.stat().st_size > MAX_BYTES:
-        raise ValueError("Encrypted bundle exceeds MAX_BYTES")
+    if bundle.stat().st_size > MAX_TOTAL_BYTES:
+        raise ValueError("Encrypted bundle exceeds MAX_TOTAL_BYTES")
     if sha256_file(bundle) != meta["bundle_sha256"]:
         raise ValueError("Encrypted bundle SHA-256 mismatch")
     run_cmd(
@@ -272,6 +374,15 @@ def openssl_decrypt(bundle: Path, meta: dict, plain_out: Path) -> None:
         ]
     )
     verify_archive(plain_out, meta)
+
+
+def decrypt_candidate(part_dir: Path, meta: dict, plain_out: Path) -> None:
+    assembled = part_dir / f".assembled-{os.getpid()}.enc"
+    try:
+        bundle = assemble_bundle(part_dir, meta, assembled)
+        openssl_decrypt(bundle, meta, plain_out)
+    finally:
+        assembled.unlink(missing_ok=True)
 
 
 def list_remote_refs(repo: Path) -> dict[str, str]:
@@ -290,17 +401,18 @@ def load_ref_candidate(repo: Path, ref: str, sha: str, dest: Path) -> tuple[Path
         git(repo, "fetch", "--depth=1", "origin", sha)
         meta_raw = git(repo, "show", f"{sha}:{META}")
         meta = validate_meta(json.loads(meta_raw))
-        bundle_path = dest / BUNDLE
-        res = subprocess.run(
-            ["git", "show", f"{sha}:{BUNDLE}"],
-            cwd=str(repo),
-            capture_output=True,
-            timeout=180,
-        )
-        if res.returncode != 0:
-            return None
-        bundle_path.write_bytes(res.stdout)
-        return (bundle_path, meta)
+        part_names = [p["name"] for p in meta["parts"]] if "parts" in meta else [BUNDLE]
+        for pname in part_names:
+            res = subprocess.run(
+                ["git", "show", f"{sha}:{pname}"],
+                cwd=str(repo),
+                capture_output=True,
+                timeout=180,
+            )
+            if res.returncode != 0:
+                return None
+            (dest / pname).write_bytes(res.stdout)
+        return (dest, meta)
     except Exception:
         return None
 
@@ -337,12 +449,13 @@ def fetch_recovery_artifacts(work: Path) -> list[tuple[Path, dict]]:
             out_dir.mkdir(parents=True, exist_ok=True)
             with zipfile.ZipFile(zip_path) as zf:
                 for member in zf.namelist():
-                    if member in {BUNDLE, META}:
+                    base = PurePosixPath(member).name
+                    if member == base and (base == META or PART_NAME_RE.fullmatch(base)):
                         zf.extract(member, out_dir)
             meta = validate_meta(json.loads((out_dir / META).read_text(encoding="utf-8")))
-            bundle = out_dir / BUNDLE
-            if bundle.is_file():
-                candidates.append((bundle, meta))
+            part_names = [p["name"] for p in meta["parts"]] if "parts" in meta else [BUNDLE]
+            if all((out_dir / pname).is_file() for pname in part_names):
+                candidates.append((out_dir, meta))
         except Exception:
             continue
         finally:
@@ -350,11 +463,21 @@ def fetch_recovery_artifacts(work: Path) -> list[tuple[Path, dict]]:
     return candidates
 
 
-def publish_refs(repo: Path, bundle: Path, meta: dict, current_refs: dict[str, str]) -> dict[str, str]:
+def publish_refs(repo: Path, pub_dir: Path, meta: dict, current_refs: dict[str, str]) -> dict[str, str]:
     validate_meta(meta)
-    if bundle.stat().st_size > MAX_BYTES:
-        raise ValueError(f"Bundle too large ({bundle.stat().st_size} B > {MAX_BYTES} B)")
-    if sha256_file(bundle) != meta["bundle_sha256"]:
+    if pub_dir.is_file():
+        pub_dir = pub_dir.parent
+    parts = meta["parts"] if "parts" in meta else [{"name": BUNDLE, "size": (pub_dir / BUNDLE).stat().st_size, "sha256": meta["bundle_sha256"]}]
+    for part in parts:
+        ppath = pub_dir / part["name"]
+        if not ppath.is_file():
+            raise ValueError(f"Missing encrypted part before publish: {part['name']}")
+        psize = ppath.stat().st_size
+        if psize > CHUNK_BYTES or psize != part["size"]:
+            raise ValueError(f"Invalid encrypted part size before publish: {part['name']}")
+        if sha256_file(ppath) != part["sha256"]:
+            raise ValueError(f"Part digest mismatch before publish: {part['name']}")
+    if len(parts) == 1 and parts[0]["name"] == BUNDLE and parts[0]["sha256"] != meta["bundle_sha256"]:
         raise ValueError("Bundle digest mismatch before publish")
 
     with tempfile.TemporaryDirectory(prefix="openbot-pub-") as tmp:
@@ -367,11 +490,13 @@ def publish_refs(repo: Path, bundle: Path, meta: dict, current_refs: dict[str, s
             "GIT_COMMITTER_NAME": "openbot-cloud-gateway[bot]",
             "GIT_COMMITTER_EMAIL": "openbot-cloud-gateway[bot]@users.noreply.github.com",
         }
-        b_hash = git(repo, "hash-object", "-w", str(bundle), env=env).strip()
+        for part in parts:
+            pname = part["name"]
+            b_hash = git(repo, "hash-object", "-w", str(pub_dir / pname), env=env).strip()
+            git(repo, "update-index", "--add", "--cacheinfo", f"100644,{b_hash},{pname}", env=env)
         meta_file = stage / META
         atomic_json(meta_file, meta)
         m_hash = git(repo, "hash-object", "-w", str(meta_file), env=env).strip()
-        git(repo, "update-index", "--add", "--cacheinfo", f"100644,{b_hash},{BUNDLE}", env=env)
         git(repo, "update-index", "--add", "--cacheinfo", f"100644,{m_hash},{META}", env=env)
         tree = git(repo, "write-tree", env=env).strip()
         msg = f"state: publish openbot generation {meta['state_seq']}"
@@ -412,15 +537,15 @@ def action_restore(repo: Path, work: Path, data_dir: Path | None, allow_bootstra
             if loaded:
                 candidates.append((loaded[0], loaded[1], idx == 0))
 
-    for bundle, meta in fetch_recovery_artifacts(work):
-        candidates.append((bundle, meta, False))
+    for part_dir, meta in fetch_recovery_artifacts(work):
+        candidates.append((part_dir, meta, False))
 
     valid: list[tuple[Path, dict, bool, Path]] = []
-    for i, (bundle, meta, is_live) in enumerate(candidates):
+    for i, (part_dir, meta, is_live) in enumerate(candidates):
         plain = work / f"cand-{i}.tar.gz"
         try:
-            openssl_decrypt(bundle, meta, plain)
-            valid.append((bundle, meta, is_live, plain))
+            decrypt_candidate(part_dir, meta, plain)
+            valid.append((part_dir, meta, is_live, plain))
         except Exception:
             plain.unlink(missing_ok=True)
 
@@ -440,13 +565,13 @@ def action_restore(repo: Path, work: Path, data_dir: Path | None, allow_bootstra
         return {"bootstrapped": False, "state_seq": 0, "recovered": False}
 
     valid.sort(key=lambda item: (item[1]["state_seq"], 1 if item[2] else 0), reverse=True)
-    best_bundle, best_meta, was_live, best_plain = valid[0]
+    best_part_dir, best_meta, was_live, best_plain = valid[0]
     for _, _, _, other_plain in valid[1:]:
         other_plain.unlink(missing_ok=True)
 
     recovered = not was_live
     if recovered and not read_only:
-        refs = publish_refs(repo, best_bundle, best_meta, refs)
+        refs = publish_refs(repo, best_part_dir, best_meta, refs)
 
     if data_dir is not None:
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -486,10 +611,11 @@ def action_seal(work: Path, data_dir: Path) -> dict:
     try:
         proof = create_data_archive(data_dir, plain)
         openssl_encrypt(plain, bundle)
-        if bundle.stat().st_size > MAX_BYTES:
-            raise RuntimeError(f"Encrypted bundle exceeds limit: {bundle.stat().st_size} B > {MAX_BYTES} B")
-        meta = {**inner, "bundle_sha256": sha256_file(bundle)}
-        openssl_decrypt(bundle, meta, verify_plain)
+        bundle_bytes = bundle.stat().st_size
+        bundle_sha = sha256_file(bundle)
+        parts = split_bundle(bundle, pub_dir)
+        meta = {**inner, "bundle_sha256": bundle_sha, "parts": parts}
+        decrypt_candidate(pub_dir, meta, verify_plain)
         atomic_json(pub_dir / META, meta)
         atomic_json(work / "snapshot-proof.json", proof)
     finally:
@@ -500,7 +626,7 @@ def action_seal(work: Path, data_dir: Path) -> dict:
     if gh_out:
         with open(gh_out, "a", encoding="utf-8") as fh:
             fh.write(f"state_seq={meta['state_seq']}\n")
-    return {"sealed_state_seq": meta["state_seq"], "encrypted_bytes": bundle.stat().st_size, **proof}
+    return {"sealed_state_seq": meta["state_seq"], "encrypted_bytes": bundle_bytes, "parts": len(parts), **proof}
 
 
 def action_publish(repo: Path, work: Path) -> dict:
@@ -511,7 +637,7 @@ def action_publish(repo: Path, work: Path) -> dict:
         raise ValueError("Published generation does not advance restored state_seq by 1")
     if meta["parent_sha256"] != ctx["base"]["bundle_sha256"]:
         raise ValueError("Published generation parent_sha256 mismatch")
-    publish_refs(repo, pub_dir / BUNDLE, meta, ctx["refs"])
+    publish_refs(repo, pub_dir, meta, ctx["refs"])
     return {"published_state_seq": meta["state_seq"]}
 
 

@@ -90,6 +90,16 @@ jobs:
             --max-runtime "$MAX_RUNTIME" \
             "${EXTRA_ARGS[@]}"
 
+      - name: Smoke-test seal and verify archive without publishing
+        if: ${{ inputs.smoke_test && steps.restore.outcome == 'success' && steps.gateway.outcome == 'success' }}
+        env:
+          OPENBOT_BUNDLE_KEY: ${{ secrets.OPENBOT_BUNDLE_KEY }}
+        run: |
+          umask 077
+          python3 ops/state_store.py seal \
+            --work "$RUNNER_TEMP/openbot-state" \
+            --data "$RUNNER_TEMP/openbot-data"
+
       - name: Seal encrypted /data state
         id: persist
         timeout-minutes: 10
@@ -111,7 +121,7 @@ jobs:
         with:
           name: openbot-recovery-bundle-${{ steps.persist.outputs.state_seq }}-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/openbot-state/publish/openbot-bundle.enc
+            ${{ runner.temp }}/openbot-state/publish/openbot-bundle*.enc
             ${{ runner.temp }}/openbot-state/publish/openbot-bundle.meta.json
           retention-days: 5
           if-no-files-found: error
