@@ -1,0 +1,22 @@
+{
+  "bundle_sha256": "6559738b8d6498f0230c6558bf6667ded1d6102f4bb8255798aafb88548a5f5e",
+  "created_at_utc": "2026-11-28T00:13:26.026259+00:00",
+  "format": 1,
+  "lineage_id": "b059d5f11c2dddbe8ca602fbbb17b4e601f0ce14e173f77b94bf5ba8411942d2",
+  "parent_sha256": "d91f1d6dcdff0f0334d843a092c8813307623bda5b1249a1bf3cffb12a61e64d",
+  "parts": [
+    {
+      "name": "openbot-bundle.part-000.enc",
+      "sha256": "31d5bc72b6b5e9d3b73dae5c00fd538d2dda7698a0f1a31c4b4fd4c0eedf7d37",
+      "size": 78643200
+    },
+    {
+      "name": "openbot-bundle.part-001.enc",
+      "sha256": "529cb9ca2c5ed627a4f1507ab0b12a4941d58f5c44a689afb60d87f818664efc",
+      "size": 1267472
+    }
+  ],
+  "source_run_attempt": 1,
+  "source_run_id": "46056250480",
+  "state_seq": 14
+}
